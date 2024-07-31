@@ -21,9 +21,8 @@ pub fn notify_and_log(
     let mut emitted_notifications = 0;
     // packets threshold
     if notifications.packets_notification.threshold.is_some() {
-        let sent_packets_entry = runtime_data.tot_sent_packets - runtime_data.tot_sent_packets_prev;
-        let received_packets_entry =
-            runtime_data.tot_received_packets - runtime_data.tot_received_packets_prev;
+        let sent_packets_entry = runtime_data.tot_out_packets - runtime_data.tot_out_packets_prev;
+        let received_packets_entry = runtime_data.tot_in_packets - runtime_data.tot_in_packets_prev;
         if received_packets_entry + sent_packets_entry
             > u128::from(notifications.packets_notification.threshold.unwrap())
         {
@@ -52,9 +51,8 @@ pub fn notify_and_log(
     }
     // bytes threshold
     if notifications.bytes_notification.threshold.is_some() {
-        let sent_bytes_entry = runtime_data.tot_sent_bytes - runtime_data.tot_sent_bytes_prev;
-        let received_bytes_entry =
-            runtime_data.tot_received_bytes - runtime_data.tot_received_bytes_prev;
+        let sent_bytes_entry = runtime_data.tot_out_bytes - runtime_data.tot_out_bytes_prev;
+        let received_bytes_entry = runtime_data.tot_in_bytes - runtime_data.tot_in_bytes_prev;
         if received_bytes_entry + sent_bytes_entry
             > u128::from(notifications.bytes_notification.threshold.unwrap())
         {
@@ -66,7 +64,6 @@ pub fn notify_and_log(
             runtime_data.logged_notifications.push_front(
                 LoggedNotification::BytesThresholdExceeded(BytesThresholdExceeded {
                     threshold: notifications.bytes_notification.previous_threshold,
-                    byte_multiple: notifications.bytes_notification.byte_multiple,
                     incoming: received_bytes_entry.try_into().unwrap(),
                     outgoing: sent_bytes_entry.try_into().unwrap(),
                     timestamp: Local::now().to_string().get(11..19).unwrap().to_string(),
@@ -100,7 +97,7 @@ pub fn notify_and_log(
                 .push_front(LoggedNotification::FavoriteTransmitted(
                     FavoriteTransmitted {
                         host: host.clone(),
-                        data_info_host: info_traffic_lock.hosts.get(host).unwrap().clone(),
+                        data_info_host: *info_traffic_lock.hosts.get(host).unwrap(),
                         timestamp: Local::now().to_string().get(11..19).unwrap().to_string(),
                     },
                 ));

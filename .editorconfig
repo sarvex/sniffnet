@@ -8,6 +8,9 @@ indent_style = space
 indent_size = 4
 trim_trailing_whitespace = true
 
+[*.rtf]
+end_of_line = crlf
+
 [{.gitignore,*.desktop}]
 indent_size = 0
 
@@ -16,3 +19,11 @@ indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
+
+[*.pdf]
+charset = unset
+end_of_line = unset
+insert_final_newline = unset
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = unset

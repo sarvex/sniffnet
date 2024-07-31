@@ -1,4 +1,13 @@
+use std::fmt;
+
+use iced::widget::svg::Handle;
+use iced::widget::Svg;
 use serde::{Deserialize, Serialize};
+
+use crate::countries::flags_pictures::{
+    CN, DE, ES, FI, FLAGS_WIDTH_BIG, FR, GB, GR, IT, JP, KR, PL, PT, RO, RU, SE, TR, UA, UZ,
+};
+use crate::StyleType;
 
 /// This enum defines the available languages.
 #[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize, Hash)]
@@ -31,8 +40,16 @@ pub enum Language {
     RU,
     /// Greek
     EL,
-    /// Persian
-    FA,
+    // /// Persian
+    // FA,
+    /// Swedish
+    SV,
+    /// Finnish
+    FI,
+    /// Japanese
+    JA,
+    /// Uzbek
+    UZ,
 }
 
 impl Default for Language {
@@ -42,30 +59,72 @@ impl Default for Language {
 }
 
 impl Language {
-    pub(crate) const COL1: [Language; 5] = [
+    pub const ALL: [Language; 18] = [
         Language::EN,
-        Language::ES,
-        Language::IT,
-        Language::PT,
-        Language::TR,
-    ];
-    pub(crate) const COL2: [Language; 5] = [
         Language::DE,
-        Language::FA,
-        Language::KO,
-        Language::RO,
-        Language::UK,
-    ];
-    pub(crate) const COL3: [Language; 5] = [
         Language::EL,
+        Language::ES,
+        Language::FI,
         Language::FR,
+        Language::IT,
+        Language::JA,
+        Language::KO,
         Language::PL,
+        Language::PT,
+        Language::RO,
         Language::RU,
+        Language::SV,
+        Language::TR,
+        Language::UK,
+        Language::UZ,
         Language::ZH,
     ];
 
-    pub fn get_radio_label(&self) -> &str {
-        match self {
+    pub fn get_flag(self) -> Svg<StyleType> {
+        Svg::new(Handle::from_memory(Vec::from(match self {
+            Language::ZH => CN,
+            Language::DE => DE,
+            Language::ES => ES,
+            Language::FR => FR,
+            Language::EN => GB,
+            Language::IT => IT,
+            Language::KO => KR,
+            Language::PL => PL,
+            Language::PT => PT,
+            Language::RO => RO,
+            Language::RU => RU,
+            Language::TR => TR,
+            Language::UK => UA,
+            Language::EL => GR,
+            // Language::FA => IR,
+            Language::SV => SE,
+            Language::FI => FI,
+            Language::JA => JP,
+            Language::UZ => UZ,
+        })))
+        .width(FLAGS_WIDTH_BIG)
+    }
+
+    pub fn is_up_to_date(self) -> bool {
+        matches!(
+            self,
+            Language::FR
+                | Language::EN
+                | Language::IT
+                | Language::DE
+                | Language::PL
+                | Language::RU
+                | Language::RO
+                | Language::JA
+                | Language::UZ
+                | Language::SV
+        )
+    }
+}
+
+impl fmt::Display for Language {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let lang_str = match self {
             Language::EN => "English",
             Language::IT => "Italiano",
             Language::FR => "Français",
@@ -75,12 +134,17 @@ impl Language {
             Language::UK => "Українська",
             Language::ZH => "简体中文",
             Language::RO => "Română",
-            Language::KO => "한국인",
+            Language::KO => "한국어",
             Language::TR => "Türkçe",
             Language::RU => "Русский",
             Language::PT => "Português",
             Language::EL => "Ελληνικά",
-            Language::FA => "فارسی",
-        }
+            // Language::FA => "فارسی",
+            Language::SV => "Svenska",
+            Language::FI => "Suomi",
+            Language::JA => "日本語",
+            Language::UZ => "O'zbekcha",
+        };
+        write!(f, "{self:?} - {lang_str}")
     }
 }

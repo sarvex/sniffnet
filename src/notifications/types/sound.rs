@@ -1,12 +1,16 @@
 use std::fmt;
 use std::thread;
 
+use iced::alignment::{Horizontal, Vertical};
+use iced::widget::Text;
+use iced::{Font, Length};
 use rodio::{Decoder, OutputStream, Sink};
 use serde::{Deserialize, Serialize};
 
+use crate::gui::styles::style_constants::FONT_SIZE_FOOTER;
 use crate::notifications::types::sound::Sound::{Gulp, Pop, Swhoosh};
-use crate::translations::translations::none_translation;
-use crate::Language;
+use crate::utils::types::icon::Icon;
+use crate::StyleType;
 
 /// Enum representing the possible notification sounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,13 +43,17 @@ impl Sound {
         }
     }
 
-    pub fn get_radio_label(self, language: Language) -> String {
+    pub fn get_text(self, font: Font) -> iced::widget::Text<'static, StyleType> {
         match self {
-            Gulp => "Gulp".to_string(),
-            Pop => "Pop".to_string(),
-            Swhoosh => "Swhoosh".to_string(),
-            Sound::None => none_translation(language),
+            Sound::Gulp => Text::new("Gulp").font(font),
+            Sound::Pop => Text::new("Pop").font(font),
+            Sound::Swhoosh => Text::new("Swhoosh").font(font),
+            Sound::None => Icon::Forbidden.to_text(),
         }
+        .size(FONT_SIZE_FOOTER)
+        .width(Length::Fill)
+        .horizontal_alignment(Horizontal::Center)
+        .vertical_alignment(Vertical::Center)
     }
 }
 

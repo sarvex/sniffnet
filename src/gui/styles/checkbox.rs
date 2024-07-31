@@ -1,45 +1,51 @@
 //! Checkbox style
 
+#![allow(clippy::module_name_repetitions)]
+
 use iced::widget::checkbox::Appearance;
-use iced::Background;
+use iced::{Background, Border};
 
-use crate::get_colors;
-use crate::gui::styles::types::element_type::ElementType;
-use crate::gui::styles::types::style_tuple::StyleTuple;
+use crate::gui::styles::style_constants::BORDER_WIDTH;
+use crate::StyleType;
 
-impl From<StyleTuple> for iced::theme::Checkbox {
-    fn from(tuple: StyleTuple) -> Self {
-        iced::theme::Checkbox::Custom(Box::new(tuple))
-    }
+#[derive(Clone, Copy, Default)]
+pub enum CheckboxType {
+    #[default]
+    Standard,
 }
 
-impl iced::widget::checkbox::StyleSheet for StyleTuple {
-    type Style = iced::Theme;
+const CHECKBOX_BORDER_RADIUS: f32 = 5.0;
+
+impl iced::widget::checkbox::StyleSheet for StyleType {
+    type Style = CheckboxType;
 
     fn active(&self, _: &Self::Style, is_checked: bool) -> Appearance {
-        let colors = get_colors(self.0);
+        let colors = self.get_palette();
+        let ext = self.get_extension();
         Appearance {
-            background: Background::Color(colors.buttons),
+            background: Background::Color(ext.buttons_color),
             icon_color: colors.text_body,
-            border_radius: 0.0,
-            border_width: if is_checked { 1.0 } else { 0.0 },
-            border_color: colors.secondary,
+            border: Border {
+                radius: CHECKBOX_BORDER_RADIUS.into(),
+                width: if is_checked { BORDER_WIDTH } else { 0.0 },
+                color: colors.secondary,
+            },
             text_color: None,
         }
     }
 
     fn hovered(&self, _: &Self::Style, _is_checked: bool) -> Appearance {
-        let colors = get_colors(self.0);
+        let colors = self.get_palette();
+        let ext = self.get_extension();
         Appearance {
-            background: Background::Color(colors.buttons),
+            background: Background::Color(ext.buttons_color),
             icon_color: colors.text_body,
-            border_radius: 0.0,
-            border_width: 1.0,
-            border_color: colors.secondary,
-            text_color: match self.1 {
-                ElementType::Badge => None,
-                _ => Some(colors.secondary),
+            border: Border {
+                radius: CHECKBOX_BORDER_RADIUS.into(),
+                width: BORDER_WIDTH,
+                color: colors.secondary,
             },
+            text_color: None,
         }
     }
 }

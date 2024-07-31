@@ -1,6 +1,7 @@
 *                   text eol=lf
 .*                  text eol=lf
 
+*.bmp               binary
 *.png               binary
 *.icns              binary
 *.ico               binary
@@ -8,6 +9,7 @@
 *.mp3               binary
 *.rtf               binary
 *.mmdb              binary
+*.pdf               binary
 
 *.rs                diff=rust
 *.md                diff=markdown

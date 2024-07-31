@@ -1,14 +1,12 @@
+use std::cmp::min;
 use std::net::IpAddr;
-use std::path::PathBuf;
-
-use iced::Color;
 
 use crate::networking::types::filters::Filters;
-use crate::networking::types::traffic_direction::TrafficDirection;
 use crate::translations::translations::{
-    active_filters_translation, none_translation, open_report_translation,
+    address_translation, ip_version_translation, protocol_translation,
 };
-use crate::{get_colors, AppProtocol, IpVersion, Language, StyleType, TransProtocol};
+use crate::translations::translations_3::{invalid_filters_translation, port_translation};
+use crate::Language;
 
 /// Application version number (to be displayed in gui footer)
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -26,100 +24,55 @@ pub fn get_percentage_string(observed: u128, filtered: u128) -> String {
     }
 }
 
-/// Computes the String representing the active filters
+pub fn get_invalid_filters_string(filters: &Filters, language: Language) -> String {
+    let mut ret_val = format!("{}:", invalid_filters_translation(language));
+    if !filters.ip_version_valid() {
+        ret_val.push_str(&format!("\n • {}", ip_version_translation(language)));
+    }
+    if !filters.protocol_valid() {
+        ret_val.push_str(&format!("\n • {}", protocol_translation(language)));
+    }
+    if !filters.address_valid() {
+        ret_val.push_str(&format!("\n • {}", address_translation(language)));
+    }
+    if !filters.port_valid() {
+        ret_val.push_str(&format!("\n • {}", port_translation(language)));
+    }
+    ret_val
+}
+
+/// Computes the string representing the active filters
 pub fn get_active_filters_string(filters: &Filters, language: Language) -> String {
-    if filters.ip.eq(&IpVersion::Other)
-        && filters.application.eq(&AppProtocol::Other)
-        && filters.transport.eq(&TransProtocol::Other)
-    {
-        format!(
-            "{}:\n   {}",
-            active_filters_translation(language),
-            none_translation(language)
-        )
-    } else {
-        let mut filters_string = String::new();
-        if filters.ip.ne(&IpVersion::Other) {
-            filters_string.push_str(&format!("{} ", filters.ip));
-        }
-        if filters.transport.ne(&TransProtocol::Other) {
-            filters_string.push_str(&format!("{} ", filters.transport));
-        }
-        if filters.application.ne(&AppProtocol::Other) {
-            filters_string.push_str(&format!("{} ", filters.application));
-        }
-        format!(
-            "{}:\n   {filters_string}",
-            active_filters_translation(language),
-        )
+    let mut filters_string = String::new();
+    if filters.ip_version_active() {
+        filters_string.push_str(&format!(
+            "• {}: {}\n",
+            ip_version_translation(language),
+            filters.pretty_print_ip()
+        ));
     }
-}
-
-/// Returns the color to be used for a specific connection of the relevant connections table in gui run page
-pub fn get_connection_color(traffic_direction: TrafficDirection, style: StyleType) -> Color {
-    if traffic_direction == TrafficDirection::Outgoing {
-        get_colors(style).outgoing
-    } else {
-        get_colors(style).incoming
+    if filters.protocol_active() {
+        filters_string.push_str(&format!(
+            "• {}: {}\n",
+            protocol_translation(language),
+            filters.pretty_print_protocol()
+        ));
     }
-}
-
-/// Returns a String representing a quantity of bytes with their proper multiple (KB, MB, GB, TB)
-pub fn get_formatted_bytes_string(bytes: u128) -> String {
-    let mut multiple_transmitted = String::new();
-    #[allow(clippy::cast_precision_loss)]
-    let mut n = bytes as f32;
-
-    match bytes {
-        0..=999 => {}
-        1_000..=999_999 => {
-            n /= 1000_f32;
-            multiple_transmitted.push('K');
-        } // kilo
-        1_000_000..=999_999_999 => {
-            n /= 1_000_000_f32;
-            multiple_transmitted.push('M');
-        } // mega
-        1_000_000_000..=999_999_999_999 => {
-            n /= 1_000_000_000_f32;
-            multiple_transmitted.push('G');
-        } // giga
-        _ => {
-            n /= 1_000_000_000_000_f32;
-            multiple_transmitted.push('T');
-        } // tera
+    if filters.address_active() {
+        filters_string.push_str(&format!(
+            "• {}: {}\n",
+            address_translation(language),
+            filters.address_str
+        ));
     }
-
-    if multiple_transmitted.is_empty() {
-        // no multiple
-        format!("{n}  ")
-    } else {
-        // with multiple
-        format!("{n:.1} {multiple_transmitted}")
+    if filters.port_active() {
+        filters_string.push_str(&format!(
+            "• {}: {}\n",
+            port_translation(language),
+            filters.port_str
+        ));
     }
-}
-
-pub fn get_report_path() -> PathBuf {
-    if let Ok(mut config_path) = confy::get_configuration_file_path("sniffnet", "file") {
-        config_path.pop();
-        config_path.push("report.txt");
-        config_path
-    } else {
-        let mut report_path = PathBuf::from(std::env::var_os("HOME").unwrap());
-        report_path.push("sniffnet_report.txt");
-        report_path
-    }
-}
-
-pub fn get_open_report_tooltip(language: Language) -> String {
-    let open_report_translation = open_report_translation(language).to_string();
-    //open_report_translation.push_str(&format!(" [{}+O]", get_command_key()));
-    let report_path = get_report_path().to_string_lossy().to_string();
-    format!(
-        "{:^len$}\n{report_path}",
-        open_report_translation,
-        len = report_path.len()
-    )
+    filters_string
 }
 
 pub fn print_cli_welcome_message() {
@@ -170,12 +123,32 @@ pub fn get_domain_from_r_dns(r_dns: String) -> String {
     }
 }
 
-pub fn get_socket_address(address: &String, port: u16) -> String {
-    if address.contains(':') {
-        // IPv6
-        format!("[{address}]:{port}")
+pub fn get_socket_address(address: &String, port: Option<u16>) -> String {
+    if let Some(res) = port {
+        if address.contains(':') {
+            // IPv6
+            format!("[{address}]:{res}")
+        } else {
+            // IPv4
+            format!("{address}:{res}")
+        }
     } else {
-        //IPv4
-        format!("{address}:{port}")
+        address.to_owned()
     }
+}
+
+pub fn get_path_termination_string(full_path: &str, i: usize) -> String {
+    let chars = full_path.chars().collect::<Vec<char>>();
+    if chars.is_empty() {
+        return String::new();
+    }
+    let tot_len = chars.len();
+    let slice_len = min(i, tot_len);
+    let suspensions = if tot_len > i { "…" } else { "" };
+    [
+        suspensions,
+        &chars[tot_len - slice_len..].iter().collect::<String>(),
+        " ",
+    ]
+    .concat()
 }

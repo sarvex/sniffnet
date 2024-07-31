@@ -1,115 +1,210 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use chrono::Local;
 use dns_lookup::lookup_addr;
-use etherparse::{Ethernet2Header, IpHeader, TransportHeader};
-use maxminddb::Reader;
-use pcap::{Active, Address, Capture, Device};
+use etherparse::{LaxPacketHeaders, LinkHeader, NetHeaders, TransportHeader};
+use pcap::{Address, Device};
 
+use crate::mmdb::asn::get_asn;
+use crate::mmdb::country::get_country;
+use crate::mmdb::types::mmdb_reader::MmdbReader;
 use crate::networking::types::address_port_pair::AddressPortPair;
-use crate::networking::types::app_protocol::from_port_to_application_protocol;
-use crate::networking::types::data_info::DataInfo;
 use crate::networking::types::data_info_host::DataInfoHost;
 use crate::networking::types::host::Host;
+use crate::networking::types::icmp_type::{IcmpType, IcmpTypeV4, IcmpTypeV6};
 use crate::networking::types::info_address_port_pair::InfoAddressPortPair;
 use crate::networking::types::my_device::MyDevice;
+use crate::networking::types::packet_filters_fields::PacketFiltersFields;
+use crate::networking::types::service::Service;
+use crate::networking::types::service_query::ServiceQuery;
 use crate::networking::types::traffic_direction::TrafficDirection;
 use crate::networking::types::traffic_type::TrafficType;
-use crate::utils::asn::asn;
-use crate::utils::countries::get_country_code;
 use crate::utils::formatted_strings::get_domain_from_r_dns;
 use crate::IpVersion::{IPv4, IPv6};
-use crate::{AppProtocol, InfoTraffic, IpVersion, TransProtocol};
+use crate::{InfoTraffic, IpVersion, Protocol};
+
+include!(concat!(env!("OUT_DIR"), "/services.rs"));
+
+/// Calls methods to analyze link, network, and transport headers.
+/// Returns the relevant collected information.
+pub fn analyze_headers(
+    headers: LaxPacketHeaders,
+    mac_addresses: &mut (Option<String>, Option<String>),
+    exchanged_bytes: &mut u128,
+    icmp_type: &mut IcmpType,
+    packet_filters_fields: &mut PacketFiltersFields,
+) -> Option<AddressPortPair> {
+    analyze_link_header(
+        headers.link,
+        &mut mac_addresses.0,
+        &mut mac_addresses.1,
+        exchanged_bytes,
+    );
+
+    if !analyze_network_header(
+        headers.net,
+        exchanged_bytes,
+        &mut packet_filters_fields.ip_version,
+        &mut packet_filters_fields.source,
+        &mut packet_filters_fields.dest,
+    ) {
+        return None;
+    }
+
+    if !analyze_transport_header(
+        headers.transport,
+        &mut packet_filters_fields.sport,
+        &mut packet_filters_fields.dport,
+        &mut packet_filters_fields.protocol,
+        icmp_type,
+    ) {
+        return None;
+    }
+
+    Some(AddressPortPair::new(
+        packet_filters_fields.source.to_string(),
+        packet_filters_fields.sport,
+        packet_filters_fields.dest.to_string(),
+        packet_filters_fields.dport,
+        packet_filters_fields.protocol,
+    ))
+}
 
 /// This function analyzes the data link layer header passed as parameter and updates variables
 /// passed by reference on the basis of the packet header content.
-pub fn analyze_link_header(
-    link_header: Option<Ethernet2Header>,
-    mac_address1: &mut String,
-    mac_address2: &mut String,
-    skip_packet: &mut bool,
+/// Returns false if packet has to be skipped.
+fn analyze_link_header(
+    link_header: Option<LinkHeader>,
+    mac_address1: &mut Option<String>,
+    mac_address2: &mut Option<String>,
+    exchanged_bytes: &mut u128,
 ) {
-    match link_header {
-        Some(header) => {
-            *mac_address1 = mac_from_dec_to_hex(header.source);
-            *mac_address2 = mac_from_dec_to_hex(header.destination);
-        }
-        _ => {
-            *skip_packet = true;
-        }
+    if let Some(LinkHeader::Ethernet2(header)) = link_header {
+        *exchanged_bytes += 14;
+        *mac_address1 = Some(mac_from_dec_to_hex(header.source));
+        *mac_address2 = Some(mac_from_dec_to_hex(header.destination));
+    } else {
+        *mac_address1 = None;
+        *mac_address2 = None;
     }
 }
 
 /// This function analyzes the network layer header passed as parameter and updates variables
 /// passed by reference on the basis of the packet header content.
-pub fn analyze_network_header(
-    network_header: Option<IpHeader>,
+/// Returns false if packet has to be skipped.
+fn analyze_network_header(
+    network_header: Option<NetHeaders>,
     exchanged_bytes: &mut u128,
     network_protocol: &mut IpVersion,
-    address1: &mut String,
-    address2: &mut String,
-    skip_packet: &mut bool,
-) {
+    address1: &mut IpAddr,
+    address2: &mut IpAddr,
+) -> bool {
     match network_header {
-        Some(IpHeader::Version4(ipv4header, _)) => {
+        Some(NetHeaders::Ipv4(ipv4header, _)) => {
             *network_protocol = IpVersion::IPv4;
-            *address1 = format!("{:?}", ipv4header.source)
-                .replace('[', "")
-                .replace(']', "")
-                .replace(',', ".")
-                .replace(' ', "");
-            *address2 = format!("{:?}", ipv4header.destination)
-                .replace('[', "")
-                .replace(']', "")
-                .replace(',', ".")
-                .replace(' ', "");
-            *exchanged_bytes = u128::from(ipv4header.payload_len);
+            *address1 = IpAddr::from(ipv4header.source);
+            *address2 = IpAddr::from(ipv4header.destination);
+            *exchanged_bytes += u128::from(ipv4header.total_len);
+            true
         }
-        Some(IpHeader::Version6(ipv6header, _)) => {
+        Some(NetHeaders::Ipv6(ipv6header, _)) => {
             *network_protocol = IpVersion::IPv6;
-            *address1 = ipv6_from_long_dec_to_short_hex(ipv6header.source);
-            *address2 = ipv6_from_long_dec_to_short_hex(ipv6header.destination);
-            *exchanged_bytes = u128::from(ipv6header.payload_length);
+            *address1 = IpAddr::from(ipv6header.source);
+            *address2 = IpAddr::from(ipv6header.destination);
+            *exchanged_bytes += u128::from(40 + ipv6header.payload_length);
+            true
         }
-        _ => {
-            *skip_packet = true;
-        }
+        _ => false,
     }
 }
 
 /// This function analyzes the transport layer header passed as parameter and updates variables
 /// passed by reference on the basis of the packet header content.
-pub fn analyze_transport_header(
+/// Returns false if packet has to be skipped.
+fn analyze_transport_header(
     transport_header: Option<TransportHeader>,
-    port1: &mut u16,
-    port2: &mut u16,
-    application_protocol: &mut AppProtocol,
-    transport_protocol: &mut TransProtocol,
-    skip_packet: &mut bool,
-) {
+    port1: &mut Option<u16>,
+    port2: &mut Option<u16>,
+    protocol: &mut Protocol,
+    icmp_type: &mut IcmpType,
+) -> bool {
     match transport_header {
         Some(TransportHeader::Udp(udp_header)) => {
-            *port1 = udp_header.source_port;
-            *port2 = udp_header.destination_port;
-            *transport_protocol = TransProtocol::UDP;
-            *application_protocol = from_port_to_application_protocol(*port1);
-            if (*application_protocol).eq(&AppProtocol::Other) {
-                *application_protocol = from_port_to_application_protocol(*port2);
-            }
+            *port1 = Some(udp_header.source_port);
+            *port2 = Some(udp_header.destination_port);
+            *protocol = Protocol::UDP;
+            true
         }
         Some(TransportHeader::Tcp(tcp_header)) => {
-            *port1 = tcp_header.source_port;
-            *port2 = tcp_header.destination_port;
-            *transport_protocol = TransProtocol::TCP;
-            *application_protocol = from_port_to_application_protocol(*port1);
-            if (*application_protocol).eq(&AppProtocol::Other) {
-                *application_protocol = from_port_to_application_protocol(*port2);
-            }
+            *port1 = Some(tcp_header.source_port);
+            *port2 = Some(tcp_header.destination_port);
+            *protocol = Protocol::TCP;
+            true
         }
-        _ => {
-            *skip_packet = true;
+        Some(TransportHeader::Icmpv4(icmpv4_header)) => {
+            *port1 = None;
+            *port2 = None;
+            *protocol = Protocol::ICMP;
+            *icmp_type = IcmpTypeV4::from_etherparse(&icmpv4_header.icmp_type);
+            true
         }
+        Some(TransportHeader::Icmpv6(icmpv6_header)) => {
+            *port1 = None;
+            *port2 = None;
+            *protocol = Protocol::ICMP;
+            *icmp_type = IcmpTypeV6::from_etherparse(&icmpv6_header.icmp_type);
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn get_service(key: &AddressPortPair, traffic_direction: TrafficDirection) -> Service {
+    if key.port1.is_none() || key.port2.is_none() || key.protocol == Protocol::ICMP {
+        return Service::NotApplicable;
+    }
+
+    // to return the service associated with the highest score:
+    // score = service_is_some * (port_is_well_known + bonus_direction)
+    // service_is_some: 1 if some, 0 if unknown
+    // port_is_well_known: 3 if well known, 1 if not
+    // bonus_direction: +1 assigned to remote port
+    let compute_service_score = |service: &Service, port: u16, bonus_direction: bool| {
+        let service_is_some = u8::from(matches!(service, Service::Name(_)));
+        let port_is_well_known = if port < 1024 { 3 } else { 1 };
+        let bonus_direction = u8::from(bonus_direction);
+        service_is_some * (port_is_well_known + bonus_direction)
+    };
+
+    let port1 = key.port1.unwrap();
+    let port2 = key.port2.unwrap();
+
+    let unknown = Service::Unknown;
+    let service1 = SERVICES
+        .get(&ServiceQuery(port1, key.protocol))
+        .unwrap_or(&unknown);
+    let service2 = SERVICES
+        .get(&ServiceQuery(port2, key.protocol))
+        .unwrap_or(&unknown);
+
+    let score1 = compute_service_score(
+        service1,
+        port1,
+        traffic_direction.ne(&TrafficDirection::Outgoing),
+    );
+    let score2 = compute_service_score(
+        service2,
+        port2,
+        traffic_direction.eq(&TrafficDirection::Outgoing),
+    );
+
+    if score1 > score2 {
+        *service1
+    } else {
+        *service2
     }
 }
 
@@ -118,25 +213,15 @@ pub fn modify_or_insert_in_map(
     info_traffic_mutex: &Arc<Mutex<InfoTraffic>>,
     key: &AddressPortPair,
     my_device: &MyDevice,
-    mac_addresses: (String, String),
+    mac_addresses: (Option<String>, Option<String>),
+    icmp_type: IcmpType,
     exchanged_bytes: u128,
-    application_protocol: AppProtocol,
 ) -> InfoAddressPortPair {
     let now = Local::now();
     let mut traffic_direction = TrafficDirection::default();
-    let source_ip = &key.address1;
-    let destination_ip = &key.address2;
-    let very_long_address = source_ip.len() > 25 || destination_ip.len() > 25;
+    let mut service = Service::Unknown;
 
-    let len = info_traffic_mutex.lock().unwrap().map.len();
-    let index = info_traffic_mutex
-        .lock()
-        .unwrap()
-        .map
-        .get_index_of(key)
-        .unwrap_or(len);
-
-    if index == len {
+    if !info_traffic_mutex.lock().unwrap().map.contains_key(key) {
         // first occurrence of key
 
         // update device addresses
@@ -144,21 +229,24 @@ pub fn modify_or_insert_in_map(
         for dev in Device::list().expect("Error retrieving device list\r\n") {
             if dev.name.eq(&my_device.name) {
                 let mut my_interface_addresses_mutex = my_device.addresses.lock().unwrap();
-                *my_interface_addresses_mutex = dev.addresses.clone();
+                my_interface_addresses_mutex.clone_from(&dev.addresses);
                 drop(my_interface_addresses_mutex);
                 my_interface_addresses = dev.addresses;
                 break;
             }
         }
         // determine traffic direction
-        traffic_direction =
-            get_traffic_direction(source_ip, destination_ip, &my_interface_addresses);
-        // traffic_type = get_traffic_type(destination_ip, &my_interface_addresses, traffic_direction);
-        // is_local = is_local_connection(address_to_lookup, &my_interface_addresses);
-        // (
-        //     get_country_code(address_to_lookup.clone(), country_db_reader),
-        //     asn(address_to_lookup.clone(), asn_db_reader),
-        // )
+        let source_ip = &key.address1;
+        let destination_ip = &key.address2;
+        traffic_direction = get_traffic_direction(
+            source_ip,
+            destination_ip,
+            key.port1,
+            key.port2,
+            &my_interface_addresses,
+        );
+        // determine upper layer service
+        service = get_service(key, traffic_direction);
     };
 
     let mut info_traffic = info_traffic_mutex
@@ -172,31 +260,33 @@ pub fn modify_or_insert_in_map(
             info.transmitted_bytes += exchanged_bytes;
             info.transmitted_packets += 1;
             info.final_timestamp = now;
+            if key.protocol.eq(&Protocol::ICMP) {
+                info.icmp_types
+                    .entry(icmp_type)
+                    .and_modify(|n| *n += 1)
+                    .or_insert(1);
+            }
         })
-        .or_insert(InfoAddressPortPair {
+        .or_insert_with(|| InfoAddressPortPair {
             mac_address1: mac_addresses.0,
             mac_address2: mac_addresses.1,
             transmitted_bytes: exchanged_bytes,
             transmitted_packets: 1,
             initial_timestamp: now,
             final_timestamp: now,
-            app_protocol: application_protocol,
-            very_long_address,
+            service,
             traffic_direction,
-            // traffic_type,
-            // country,
-            // asn,
-            // r_dns: None,
-            index,
-            // is_local,
+            icmp_types: if key.protocol.eq(&Protocol::ICMP) {
+                HashMap::from([(icmp_type, 1)])
+            } else {
+                HashMap::new()
+            },
         })
         .clone();
 
-    info_traffic.addresses_last_interval.insert(index);
-
     if let Some(host_info) = info_traffic
         .addresses_resolved
-        .get(&get_address_to_lookup(key, traffic_direction))
+        .get(&get_address_to_lookup(key, new_info.traffic_direction))
         .cloned()
     {
         if info_traffic.favorite_hosts.contains(&host_info.1) {
@@ -212,8 +302,8 @@ pub fn reverse_dns_lookup(
     key: &AddressPortPair,
     traffic_direction: TrafficDirection,
     my_device: &MyDevice,
-    country_db_reader: &Reader<&[u8]>,
-    asn_db_reader: &Reader<&[u8]>,
+    country_db_reader: &Arc<MmdbReader>,
+    asn_db_reader: &Arc<MmdbReader>,
 ) {
     let address_to_lookup = get_address_to_lookup(key, traffic_direction);
     let my_interface_addresses = my_device.addresses.lock().unwrap().clone();
@@ -227,9 +317,10 @@ pub fn reverse_dns_lookup(
         &my_interface_addresses,
         traffic_direction,
     );
+    let is_loopback = is_loopback(&address_to_lookup);
     let is_local = is_local_connection(&address_to_lookup, &my_interface_addresses);
-    let country = get_country_code(&address_to_lookup, country_db_reader);
-    let asn = asn(&address_to_lookup, asn_db_reader);
+    let country = get_country(&address_to_lookup, country_db_reader);
+    let asn = get_asn(&address_to_lookup, asn_db_reader);
     let r_dns = if let Ok(result) = lookup_result {
         if result.is_empty() {
             address_to_lookup.clone()
@@ -250,7 +341,7 @@ pub fn reverse_dns_lookup(
     let other_data = info_traffic_lock
         .addresses_waiting_resolution
         .remove(&address_to_lookup)
-        .unwrap_or(DataInfo::default());
+        .unwrap_or_default();
     // insert the newly resolved host in the collections, with the data it exchanged so far
     info_traffic_lock
         .addresses_resolved
@@ -259,14 +350,12 @@ pub fn reverse_dns_lookup(
         .hosts
         .entry(new_host.clone())
         .and_modify(|data_info_host| {
-            data_info_host.data_info.outgoing_packets += other_data.outgoing_packets;
-            data_info_host.data_info.outgoing_bytes += other_data.outgoing_bytes;
-            data_info_host.data_info.incoming_packets += other_data.incoming_packets;
-            data_info_host.data_info.incoming_bytes += other_data.incoming_bytes;
+            data_info_host.data_info += other_data;
         })
-        .or_insert(DataInfoHost {
+        .or_insert_with(|| DataInfoHost {
             data_info: other_data,
             is_favorite: false,
+            is_loopback,
             is_local,
             traffic_type,
         });
@@ -282,6 +371,8 @@ pub fn reverse_dns_lookup(
 fn get_traffic_direction(
     source_ip: &String,
     destination_ip: &String,
+    source_port: Option<u16>,
+    dest_port: Option<u16>,
     my_interface_addresses: &[Address],
 ) -> TrafficDirection {
     let my_interface_addresses_string: Vec<String> = my_interface_addresses
@@ -289,14 +380,25 @@ fn get_traffic_direction(
         .map(|address| address.addr.to_string())
         .collect();
 
+    // first let's handle TCP and UDP loopback
+    if is_loopback(source_ip) && is_loopback(destination_ip) {
+        if let (Some(sport), Some(dport)) = (source_port, dest_port) {
+            return if sport > dport {
+                TrafficDirection::Outgoing
+            } else {
+                TrafficDirection::Incoming
+            };
+        }
+    }
+
     if my_interface_addresses_string.contains(source_ip) {
         // source is local
         TrafficDirection::Outgoing
-    } else if source_ip.ne("0.0.0.0") {
-        // source not local and different from 0.0.0.0
+    } else if source_ip.ne("0.0.0.0") && source_ip.ne("::") {
+        // source not local and different from 0.0.0.0 and different from ::
         TrafficDirection::Incoming
     } else if !my_interface_addresses_string.contains(destination_ip) {
-        // source is 0.0.0.0 (local not yet assigned an IP) and destination is not local
+        // source is 0.0.0.0 or :: (local not yet assigned an IP) and destination is not local
         TrafficDirection::Outgoing
     } else {
         TrafficDirection::Incoming
@@ -366,7 +468,7 @@ fn is_broadcast_address(address: &str, my_interface_addresses: &[Address]) -> bo
         .map(|address| {
             address
                 .broadcast_addr
-                .unwrap_or("255.255.255.255".parse().unwrap())
+                .unwrap_or_else(|| "255.255.255.255".parse().unwrap())
                 .to_string()
         })
         .collect();
@@ -376,8 +478,14 @@ fn is_broadcast_address(address: &str, my_interface_addresses: &[Address]) -> bo
     false
 }
 
+fn is_loopback(address_to_lookup: &str) -> bool {
+    IpAddr::from_str(address_to_lookup)
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .is_loopback()
+}
+
 /// Determines if the connection is local
-fn is_local_connection(address_to_lookup: &str, my_interface_addresses: &Vec<Address>) -> bool {
+pub fn is_local_connection(address_to_lookup: &str, my_interface_addresses: &Vec<Address>) -> bool {
     let mut ret_val = false;
 
     let address_to_lookup_type = if address_to_lookup.contains(':') {
@@ -390,8 +498,9 @@ fn is_local_connection(address_to_lookup: &str, my_interface_addresses: &Vec<Add
         match address.addr {
             IpAddr::V4(local_addr) if address_to_lookup_type.eq(&IPv4) => {
                 // check if the two IPv4 addresses are in the same subnet
-                let address_to_lookup_parsed: Ipv4Addr =
-                    address_to_lookup.parse().unwrap_or(Ipv4Addr::from(0));
+                let address_to_lookup_parsed: Ipv4Addr = address_to_lookup
+                    .parse()
+                    .unwrap_or_else(|_| Ipv4Addr::from(0));
                 // remote is link local?
                 if address_to_lookup_parsed.is_link_local() {
                     ret_val = true;
@@ -414,8 +523,9 @@ fn is_local_connection(address_to_lookup: &str, my_interface_addresses: &Vec<Add
             }
             IpAddr::V6(local_addr) if address_to_lookup_type.eq(&IPv6) => {
                 // check if the two IPv6 addresses are in the same subnet
-                let address_to_lookup_parsed: Ipv6Addr =
-                    address_to_lookup.parse().unwrap_or(Ipv6Addr::from(0));
+                let address_to_lookup_parsed: Ipv6Addr = address_to_lookup
+                    .parse()
+                    .unwrap_or_else(|_| Ipv6Addr::from(0));
                 // remote is link local?
                 if address_to_lookup.starts_with("fe80") {
                     ret_val = true;
@@ -444,33 +554,13 @@ fn is_local_connection(address_to_lookup: &str, my_interface_addresses: &Vec<Add
 }
 
 /// Determines if the address passed as parameter belong to the chosen adapter
-pub fn is_my_address(address_to_lookup: &String, my_interface_addresses: &Vec<Address>) -> bool {
-    let mut ret_val = false;
-
+pub fn is_my_address(local_address: &String, my_interface_addresses: &Vec<Address>) -> bool {
     for address in my_interface_addresses {
-        if address.addr.to_string().eq(address_to_lookup) {
-            ret_val = true;
-            break;
+        if address.addr.to_string().eq(local_address) {
+            return true;
         }
     }
-
-    ret_val
-}
-
-/// Determines if the capture opening resolves into an Error
-pub fn get_capture_result(device: &MyDevice) -> (Option<String>, Option<Capture<Active>>) {
-    let cap_result = Capture::from_device(&*device.name)
-        .expect("Capture initialization error\n\r")
-        .promisc(true)
-        .snaplen(256) //limit stored packets slice dimension (to keep more in the buffer)
-        .immediate_mode(true) //parse packets ASAP!
-        .open();
-    if cap_result.is_err() {
-        let err_string = cap_result.err().unwrap().to_string();
-        (Some(err_string), None)
-    } else {
-        (None, cap_result.ok())
-    }
+    is_loopback(local_address)
 }
 
 /// Converts a MAC address in its hexadecimal form
@@ -490,110 +580,25 @@ pub fn get_address_to_lookup(key: &AddressPortPair, traffic_direction: TrafficDi
     }
 }
 
-/// Function to convert a long decimal ipv6 address to a
-/// shorter compressed ipv6 address
-///
-/// # Arguments
-///
-/// * `ipv6_long` - Contains the 16 integer composing the not compressed decimal ipv6 address
-///
-/// # Example
-///
-/// ```
-/// let result = ipv6_from_long_dec_to_short_hex([255,10,10,255,0,0,0,0,28,4,4,28,255,1,0,0]);
-/// assert_eq!(result, "ff0a:aff::1c04:41c:ff01:0".to_string());
-/// ```
-fn ipv6_from_long_dec_to_short_hex(ipv6_long: [u8; 16]) -> String {
-    //from hex to dec, paying attention to the correct number of digits
-    let mut ipv6_hex = String::new();
-    for i in 0..=15 {
-        //even: first byte of the group
-        if i % 2 == 0 {
-            if *ipv6_long.get(i).unwrap() == 0 {
-                continue;
-            }
-            ipv6_hex.push_str(&format!("{:x}", ipv6_long.get(i).unwrap()));
-        }
-        //odd: second byte of the group
-        else if *ipv6_long.get(i - 1).unwrap() == 0 {
-            ipv6_hex.push_str(&format!("{:x}:", ipv6_long.get(i).unwrap()));
-        } else {
-            ipv6_hex.push_str(&format!("{:02x}:", ipv6_long.get(i).unwrap()));
-        }
-    }
-    ipv6_hex.pop();
-
-    // search for the longest zero sequence in the ipv6 address
-    let mut to_compress: Vec<&str> = ipv6_hex.split(':').collect();
-    let mut longest_zero_sequence = 0; // max number of consecutive zeros
-    let mut longest_zero_sequence_start = 0; // first index of the longest sequence of zeros
-    let mut current_zero_sequence = 0;
-    let mut current_zero_sequence_start = 0;
-    let mut i = 0;
-    for s in to_compress.clone() {
-        if s.eq("0") {
-            if current_zero_sequence == 0 {
-                current_zero_sequence_start = i;
-            }
-            current_zero_sequence += 1;
-        } else if current_zero_sequence != 0 {
-            if current_zero_sequence > longest_zero_sequence {
-                longest_zero_sequence = current_zero_sequence;
-                longest_zero_sequence_start = current_zero_sequence_start;
-            }
-            current_zero_sequence = 0;
-        }
-        i += 1;
-    }
-    if current_zero_sequence != 0 {
-        // to catch consecutive zeros at the end
-        if current_zero_sequence > longest_zero_sequence {
-            longest_zero_sequence = current_zero_sequence;
-            longest_zero_sequence_start = current_zero_sequence_start;
-        }
-    }
-    if longest_zero_sequence < 2 {
-        // no compression needed
-        return ipv6_hex;
-    }
-
-    //from longest sequence of consecutive zeros to '::'
-    let mut ipv6_hex_compressed = String::new();
-    for _ in 0..longest_zero_sequence {
-        to_compress.remove(longest_zero_sequence_start);
-    }
-    i = 0;
-    if longest_zero_sequence_start == 0 {
-        ipv6_hex_compressed.push_str("::");
-    }
-    for s in to_compress {
-        ipv6_hex_compressed.push_str(s);
-        ipv6_hex_compressed.push(':');
-        i += 1;
-        if i == longest_zero_sequence_start {
-            ipv6_hex_compressed.push(':');
-        }
-    }
-    if ipv6_hex_compressed.ends_with("::") {
-        return ipv6_hex_compressed;
-    }
-    ipv6_hex_compressed.pop();
-
-    ipv6_hex_compressed
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::net::IpAddr;
 
     use pcap::Address;
 
     use crate::networking::manage_packets::{
-        get_traffic_direction, get_traffic_type, ipv6_from_long_dec_to_short_hex,
-        is_local_connection, mac_from_dec_to_hex,
+        get_service, get_traffic_direction, get_traffic_type, is_local_connection,
+        mac_from_dec_to_hex,
     };
+    use crate::networking::types::address_port_pair::AddressPortPair;
+    use crate::networking::types::service_query::ServiceQuery;
     use crate::networking::types::traffic_direction::TrafficDirection;
     use crate::networking::types::traffic_type::TrafficType;
+    use crate::Protocol;
+    use crate::Service;
+
+    include!(concat!(env!("OUT_DIR"), "/services.rs"));
 
     #[test]
     fn mac_simple_test() {
@@ -609,101 +614,94 @@ mod tests {
 
     #[test]
     fn ipv6_simple_test() {
-        let result = ipv6_from_long_dec_to_short_hex([
+        let result = IpAddr::from([
             255, 10, 10, 255, 255, 10, 10, 255, 255, 10, 10, 255, 255, 10, 10, 255,
         ]);
-        assert_eq!(result, "ff0a:aff:ff0a:aff:ff0a:aff:ff0a:aff".to_string());
+        assert_eq!(
+            result.to_string(),
+            "ff0a:aff:ff0a:aff:ff0a:aff:ff0a:aff".to_string()
+        );
     }
 
     #[test]
     fn ipv6_zeros_in_the_middle() {
-        let result = ipv6_from_long_dec_to_short_hex([
-            255, 10, 10, 255, 0, 0, 0, 0, 28, 4, 4, 28, 255, 1, 0, 0,
-        ]);
+        let result =
+            IpAddr::from([255, 10, 10, 255, 0, 0, 0, 0, 28, 4, 4, 28, 255, 1, 0, 0]).to_string();
         assert_eq!(result, "ff0a:aff::1c04:41c:ff01:0".to_string());
     }
 
     #[test]
     fn ipv6_leading_zeros() {
         let result =
-            ipv6_from_long_dec_to_short_hex([0, 0, 0, 0, 0, 0, 0, 0, 28, 4, 4, 28, 255, 1, 0, 10]);
+            IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 28, 4, 4, 28, 255, 1, 0, 10]).to_string();
         assert_eq!(result, "::1c04:41c:ff01:a".to_string());
     }
 
     #[test]
     fn ipv6_tail_one_after_zeros() {
         let result =
-            ipv6_from_long_dec_to_short_hex([28, 4, 4, 28, 255, 1, 0, 10, 0, 0, 0, 0, 0, 0, 0, 1]);
+            IpAddr::from([28, 4, 4, 28, 255, 1, 0, 10, 0, 0, 0, 0, 0, 0, 0, 1]).to_string();
         assert_eq!(result, "1c04:41c:ff01:a::1".to_string());
     }
 
     #[test]
     fn ipv6_tail_zeros() {
         let result =
-            ipv6_from_long_dec_to_short_hex([28, 4, 4, 28, 255, 1, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0]);
+            IpAddr::from([28, 4, 4, 28, 255, 1, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0]).to_string();
         assert_eq!(result, "1c04:41c:ff01:a::".to_string());
     }
 
     #[test]
     fn ipv6_multiple_zero_sequences_first_longer() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([32, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1]);
+        let result = IpAddr::from([32, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1]).to_string();
         assert_eq!(result, "2000::101:0:0:1".to_string());
     }
 
     #[test]
     fn ipv6_multiple_zero_sequences_first_longer_head() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1]);
+        let result = IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1]).to_string();
         assert_eq!(result, "::101:0:0:1".to_string());
     }
 
     #[test]
     fn ipv6_multiple_zero_sequences_second_longer() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, 118]);
+        let result = IpAddr::from([1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3, 118]).to_string();
         assert_eq!(result, "100:0:0:1::376".to_string());
     }
 
     #[test]
     fn ipv6_multiple_zero_sequences_second_longer_tail() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([32, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0]);
+        let result = IpAddr::from([32, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0]).to_string();
         assert_eq!(result, "2000:0:0:1:101::".to_string());
     }
 
     #[test]
     fn ipv6_multiple_zero_sequences_equal_length() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([118, 3, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1]);
+        let result = IpAddr::from([118, 3, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1]).to_string();
         assert_eq!(result, "7603::1:101:0:0:1".to_string());
     }
 
     #[test]
     fn ipv6_all_zeros() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let result = IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).to_string();
         assert_eq!(result, "::".to_string());
     }
 
     #[test]
     fn ipv6_x_all_zeros() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([161, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let result = IpAddr::from([161, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).to_string();
         assert_eq!(result, "a100::".to_string());
     }
 
     #[test]
     fn ipv6_all_zeros_x() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 176]);
+        let result = IpAddr::from([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 176]).to_string();
         assert_eq!(result, "::b0".to_string());
     }
 
     #[test]
     fn ipv6_many_zeros_but_no_compression() {
-        let result =
-            ipv6_from_long_dec_to_short_hex([0, 16, 16, 0, 0, 1, 7, 0, 0, 2, 216, 0, 1, 0, 0, 1]);
+        let result = IpAddr::from([0, 16, 16, 0, 0, 1, 7, 0, 0, 2, 216, 0, 1, 0, 0, 1]).to_string();
         assert_eq!(result, "10:1000:1:700:2:d800:100:1".to_string());
     }
 
@@ -728,30 +726,40 @@ mod tests {
         let result1 = get_traffic_direction(
             &"172.20.10.9".to_string(),
             &"99.88.77.00".to_string(),
+            Some(99),
+            Some(99),
             &address_vec,
         );
         assert_eq!(result1, TrafficDirection::Outgoing);
         let result2 = get_traffic_direction(
             &"172.20.10.10".to_string(),
             &"172.20.10.9".to_string(),
+            Some(99),
+            Some(99),
             &address_vec,
         );
         assert_eq!(result2, TrafficDirection::Incoming);
         let result3 = get_traffic_direction(
             &"172.20.10.9".to_string(),
             &"0.0.0.0".to_string(),
+            Some(99),
+            Some(99),
             &address_vec,
         );
         assert_eq!(result3, TrafficDirection::Outgoing);
         let result4 = get_traffic_direction(
             &"0.0.0.0".to_string(),
             &"172.20.10.9".to_string(),
+            Some(99),
+            Some(99),
             &address_vec,
         );
         assert_eq!(result4, TrafficDirection::Incoming);
         let result4 = get_traffic_direction(
             &"0.0.0.0".to_string(),
             &"172.20.10.10".to_string(),
+            Some(99),
+            Some(99),
             &address_vec,
         );
         assert_eq!(result4, TrafficDirection::Outgoing);
@@ -1054,5 +1062,589 @@ mod tests {
 
         let result3 = is_local_connection("fe70::8b1:1234:5678:d065", &address_vec);
         assert_eq!(result3, false);
+    }
+
+    #[test]
+    fn test_get_service_simple_only_one_valid() {
+        let unknown_port = Some(65000);
+        for p in [Protocol::TCP, Protocol::UDP] {
+            assert!(SERVICES
+                .get(&ServiceQuery(unknown_port.unwrap(), p))
+                .is_none());
+            for d in [TrafficDirection::Incoming, TrafficDirection::Outgoing] {
+                let key = AddressPortPair::new(
+                    String::new(),
+                    unknown_port,
+                    String::new(),
+                    unknown_port,
+                    p,
+                );
+                assert_eq!(get_service(&key, d), Service::Unknown);
+
+                for (p1, p2) in [
+                    (unknown_port, Some(22)),
+                    (Some(22), unknown_port),
+                    (Some(22), Some(22)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("ssh"));
+                }
+
+                for (p1, p2) in [
+                    (unknown_port, Some(443)),
+                    (Some(443), unknown_port),
+                    (Some(443), Some(443)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("https"));
+                }
+
+                for (p1, p2) in [
+                    (unknown_port, Some(80)),
+                    (Some(80), unknown_port),
+                    (Some(80), Some(80)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("http"));
+                }
+
+                for (p1, p2) in [
+                    (unknown_port, Some(1900)),
+                    (Some(1900), unknown_port),
+                    (Some(1900), Some(1900)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("upnp"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_service_well_known_ports_always_win() {
+        let valid_but_not_well_known = Some(1030);
+        for p in [Protocol::TCP, Protocol::UDP] {
+            assert_eq!(
+                SERVICES
+                    .get(&ServiceQuery(valid_but_not_well_known.unwrap(), p))
+                    .unwrap(),
+                &Service::Name("iad1")
+            );
+            for d in [TrafficDirection::Incoming, TrafficDirection::Outgoing] {
+                let key = AddressPortPair::new(
+                    String::new(),
+                    valid_but_not_well_known,
+                    String::new(),
+                    valid_but_not_well_known,
+                    p,
+                );
+                assert_eq!(get_service(&key, d), Service::Name("iad1"));
+
+                for (p1, p2) in [
+                    (valid_but_not_well_known, Some(67)),
+                    (Some(67), valid_but_not_well_known),
+                    (Some(67), Some(67)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("dhcps"));
+                }
+
+                for (p1, p2) in [
+                    (valid_but_not_well_known, Some(179)),
+                    (Some(179), valid_but_not_well_known),
+                    (Some(179), Some(179)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("bgp"));
+                }
+
+                for (p1, p2) in [
+                    (valid_but_not_well_known, Some(53)),
+                    (Some(53), valid_but_not_well_known),
+                    (Some(53), Some(53)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("domain"));
+                }
+
+                for (p1, p2) in [
+                    (valid_but_not_well_known, Some(1022)),
+                    (Some(1022), valid_but_not_well_known),
+                    (Some(1022), Some(1022)),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("exp2"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_service_direction_bonus_matters() {
+        let smtp = Some(25);
+        let tacacs = Some(49);
+        let netmagic = Some(1196);
+        let tgp = Some(1223);
+
+        for p in [Protocol::TCP, Protocol::UDP] {
+            for d in [TrafficDirection::Incoming, TrafficDirection::Outgoing] {
+                for (p1, p2) in [(smtp, tacacs), (tacacs, smtp)] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(
+                        get_service(&key, d),
+                        Service::Name(match (p1, d) {
+                            (source, TrafficDirection::Incoming) if source == tacacs => "tacacs",
+                            (source, TrafficDirection::Outgoing) if source == tacacs => "smtp",
+                            (source, TrafficDirection::Incoming) if source == smtp => "smtp",
+                            (source, TrafficDirection::Outgoing) if source == smtp => "tacacs",
+                            _ => panic!(),
+                        })
+                    );
+                }
+
+                for (p1, p2) in [(netmagic, tgp), (tgp, netmagic)] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(
+                        get_service(&key, d),
+                        Service::Name(match (p1, d) {
+                            (source, TrafficDirection::Incoming) if source == netmagic =>
+                                "netmagic",
+                            (source, TrafficDirection::Outgoing) if source == netmagic => "tgp",
+                            (source, TrafficDirection::Incoming) if source == tgp => "tgp",
+                            (source, TrafficDirection::Outgoing) if source == tgp => "netmagic",
+                            _ => panic!(),
+                        })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_service_different_tcp_udp() {
+        for p in [Protocol::TCP, Protocol::UDP] {
+            for d in [TrafficDirection::Incoming, TrafficDirection::Outgoing] {
+                let key =
+                    AddressPortPair::new(String::new(), Some(5353), String::new(), Some(5353), p);
+                assert_eq!(
+                    get_service(&key, d),
+                    Service::Name(match p {
+                        Protocol::TCP => "mdns",
+                        Protocol::UDP => "zeroconf",
+                        Protocol::ICMP => panic!(),
+                    })
+                );
+
+                let key = AddressPortPair::new(String::new(), Some(15), String::new(), Some(15), p);
+                assert_eq!(
+                    get_service(&key, d),
+                    match p {
+                        Protocol::TCP => Service::Name("netstat"),
+                        Protocol::UDP => Service::Unknown,
+                        Protocol::ICMP => panic!(),
+                    }
+                );
+
+                let key =
+                    AddressPortPair::new(String::new(), Some(64738), String::new(), Some(64738), p);
+                assert_eq!(
+                    get_service(&key, d),
+                    match p {
+                        Protocol::TCP => Service::Unknown,
+                        Protocol::UDP => Service::Name("murmur"),
+                        Protocol::ICMP => panic!(),
+                    }
+                );
+
+                for (p1, p2) in [(Some(5353), Some(53)), (Some(53), Some(5353))] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Name("domain"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_service_not_applicable() {
+        for p in Protocol::ALL {
+            for d in [TrafficDirection::Incoming, TrafficDirection::Outgoing] {
+                for (p1, p2) in [(None, Some(443)), (None, None), (Some(443), None)] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::NotApplicable);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_service_unknown() {
+        let unknown_port_1 = Some(39332);
+        let unknown_port_2 = Some(23679);
+        for p in [Protocol::TCP, Protocol::UDP] {
+            assert!(SERVICES
+                .get(&ServiceQuery(unknown_port_1.unwrap(), p))
+                .is_none());
+            assert!(SERVICES
+                .get(&ServiceQuery(unknown_port_2.unwrap(), p))
+                .is_none());
+            for d in [TrafficDirection::Incoming, TrafficDirection::Outgoing] {
+                for (p1, p2) in [
+                    (unknown_port_1, unknown_port_2),
+                    (unknown_port_2, unknown_port_1),
+                    (unknown_port_1, unknown_port_1),
+                    (unknown_port_2, unknown_port_2),
+                ] {
+                    let key = AddressPortPair::new(String::new(), p1, String::new(), p2, p);
+                    assert_eq!(get_service(&key, d), Service::Unknown);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_services_map_key_and_values_are_valid() {
+        assert_eq!(SERVICES.len(), 12078);
+        let mut distinct_services = HashSet::new();
+        for (sq, s) in &SERVICES {
+            // only tcp or udp
+            assert!(sq.1 == Protocol::TCP || sq.1 == Protocol::UDP);
+            // no unknown or not applicable services
+            let name = match *s {
+                Service::Name(name) => name,
+                _ => panic!(),
+            };
+            // name is valid...
+            assert!(
+                !["", "unknown", "-"].contains(&name)
+                    && name.is_ascii()
+                    && !name.starts_with('#')
+                    && !name.contains(' ')
+                    && !name.contains('?')
+            );
+            // just to count and verify number of distinct services
+            distinct_services.insert(name.to_string());
+        }
+        assert_eq!(distinct_services.len(), 6450);
+    }
+
+    #[test]
+    fn test_service_names_of_old_application_protocols() {
+        for p in [Protocol::TCP, Protocol::UDP] {
+            // FTP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(20, p)).unwrap(),
+                &Service::Name("ftp-data")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(21, p)).unwrap(),
+                &Service::Name("ftp")
+            );
+
+            // SSH
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(22, p)).unwrap(),
+                &Service::Name("ssh")
+            );
+
+            // Telnet
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(23, p)).unwrap(),
+                &Service::Name("telnet")
+            );
+
+            // SMTP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(25, p)).unwrap(),
+                &Service::Name("smtp")
+            );
+
+            // TACACS
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(49, p)).unwrap(),
+                &Service::Name("tacacs")
+            );
+
+            // DNS
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(53, p)).unwrap(),
+                &Service::Name("domain")
+            );
+
+            // DHCP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(67, p)).unwrap(),
+                &Service::Name("dhcps")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(68, p)).unwrap(),
+                &Service::Name("dhcpc")
+            );
+
+            // TFTP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(69, p)).unwrap(),
+                &Service::Name("tftp")
+            );
+
+            // HTTP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(80, p)).unwrap(),
+                &Service::Name("http")
+            );
+
+            // POP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(109, p)).unwrap(),
+                &Service::Name("pop2")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(110, p)).unwrap(),
+                &Service::Name("pop3")
+            );
+
+            // NTP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(123, p)).unwrap(),
+                &Service::Name("ntp")
+            );
+
+            // NetBIOS
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(137, p)).unwrap(),
+                &Service::Name("netbios-ns")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(138, p)).unwrap(),
+                &Service::Name("netbios-dgm")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(139, p)).unwrap(),
+                &Service::Name("netbios-ssn")
+            );
+
+            // IMAP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(143, p)).unwrap(),
+                &Service::Name("imap")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(220, p)).unwrap(),
+                &Service::Name("imap3")
+            );
+
+            // SNMP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(161, p)).unwrap(),
+                &Service::Name("snmp")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(162, p)).unwrap(),
+                &Service::Name("snmptrap")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(199, p)).unwrap(),
+                &Service::Name("smux")
+            );
+
+            // BGP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(179, p)).unwrap(),
+                &Service::Name("bgp")
+            );
+
+            // LDAP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(389, p)).unwrap(),
+                &Service::Name("ldap")
+            );
+
+            // HTTPS
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(443, p)).unwrap(),
+                &Service::Name("https")
+            );
+
+            // FTPS
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(989, p)).unwrap(),
+                &Service::Name("ftps-data")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(990, p)).unwrap(),
+                &Service::Name("ftps")
+            );
+
+            // IMAPS
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(993, p)).unwrap(),
+                &Service::Name("imaps")
+            );
+
+            // POP3S
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(995, p)).unwrap(),
+                &Service::Name("pop3s")
+            );
+
+            // SSDP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(1900, p)).unwrap(),
+                &Service::Name("upnp")
+            );
+
+            // XMPP
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(5222, p)).unwrap(),
+                &Service::Name("xmpp-client")
+            );
+        }
+
+        // HTTP
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(8080, Protocol::TCP)).unwrap(),
+            &Service::Name("http-proxy")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(8080, Protocol::UDP)).unwrap(),
+            &Service::Name("http-alt")
+        );
+
+        // LDAPS
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(636, Protocol::TCP)).unwrap(),
+            &Service::Name("ldapssl")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(636, Protocol::UDP)).unwrap(),
+            &Service::Name("ldaps")
+        );
+
+        // mDNS
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(5353, Protocol::TCP)).unwrap(),
+            &Service::Name("mdns")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(5353, Protocol::UDP)).unwrap(),
+            &Service::Name("zeroconf")
+        );
+    }
+
+    #[test]
+    fn test_other_service_names() {
+        for p in [Protocol::TCP, Protocol::UDP] {
+            assert!(SERVICES.get(&ServiceQuery(4, p)).is_none());
+            assert!(SERVICES.get(&ServiceQuery(6, p)).is_none());
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(7, p)).unwrap(),
+                &Service::Name("echo")
+            );
+            assert!(SERVICES.get(&ServiceQuery(5811, p)).is_none());
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(6004, p)).unwrap(),
+                &Service::Name("X11:4")
+            );
+            assert_eq!(
+                SERVICES.get(&ServiceQuery(7777, p)).unwrap(),
+                &Service::Name("cbt")
+            );
+            assert!(SERVICES.get(&ServiceQuery(65000, p)).is_none());
+        }
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(15, Protocol::TCP)).unwrap(),
+            &Service::Name("netstat")
+        );
+        assert!(SERVICES.get(&ServiceQuery(15, Protocol::UDP)).is_none());
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(26, Protocol::TCP)).unwrap(),
+            &Service::Name("rsftp")
+        );
+        assert!(SERVICES.get(&ServiceQuery(26, Protocol::UDP)).is_none());
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(87, Protocol::TCP)).unwrap(),
+            &Service::Name("priv-term-l")
+        );
+        assert!(SERVICES.get(&ServiceQuery(87, Protocol::UDP)).is_none());
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(106, Protocol::TCP)).unwrap(),
+            &Service::Name("pop3pw")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(106, Protocol::UDP)).unwrap(),
+            &Service::Name("3com-tsmux")
+        );
+
+        assert!(SERVICES.get(&ServiceQuery(1028, Protocol::TCP)).is_none());
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(1028, Protocol::UDP)).unwrap(),
+            &Service::Name("ms-lsa")
+        );
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(1029, Protocol::TCP)).unwrap(),
+            &Service::Name("ms-lsa")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(1029, Protocol::UDP)).unwrap(),
+            &Service::Name("solid-mux")
+        );
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(5820, Protocol::TCP)).unwrap(),
+            &Service::Name("autopassdaemon")
+        );
+        assert!(SERVICES.get(&ServiceQuery(5820, Protocol::UDP)).is_none());
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(5900, Protocol::TCP)).unwrap(),
+            &Service::Name("vnc")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(5900, Protocol::UDP)).unwrap(),
+            &Service::Name("rfb")
+        );
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(5938, Protocol::TCP)).unwrap(),
+            &Service::Name("teamviewer")
+        );
+        assert!(SERVICES.get(&ServiceQuery(5938, Protocol::UDP)).is_none());
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(8888, Protocol::TCP)).unwrap(),
+            &Service::Name("sun-answerbook")
+        );
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(8888, Protocol::UDP)).unwrap(),
+            &Service::Name("ddi-udp-1")
+        );
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(23294, Protocol::TCP)).unwrap(),
+            &Service::Name("5afe-dir")
+        );
+        assert!(SERVICES.get(&ServiceQuery(23294, Protocol::UDP)).is_none());
+
+        assert!(SERVICES.get(&ServiceQuery(48899, Protocol::TCP)).is_none());
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(48899, Protocol::UDP)).unwrap(),
+            &Service::Name("tc_ads_discovery")
+        );
+
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(62078, Protocol::TCP)).unwrap(),
+            &Service::Name("iphone-sync")
+        );
+        assert!(SERVICES.get(&ServiceQuery(62078, Protocol::UDP)).is_none());
+
+        assert!(SERVICES.get(&ServiceQuery(64738, Protocol::TCP)).is_none());
+        assert_eq!(
+            SERVICES.get(&ServiceQuery(64738, Protocol::UDP)).unwrap(),
+            &Service::Name("murmur")
+        );
     }
 }
